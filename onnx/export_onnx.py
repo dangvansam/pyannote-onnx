@@ -38,8 +38,6 @@ def main():
     )
     so = ort.SessionOptions()
     so.optimized_model_filepath = onnx_filepath
-    # so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    # ORT_DISABLE_ALL, ORT_ENABLE_BASIC, ORT_ENABLE_EXTENDED, ORT_ENABLE_ALL
     ort.InferenceSession(onnx_filepath, sess_options=so)
     logger.success("export to onnx model success")
 
