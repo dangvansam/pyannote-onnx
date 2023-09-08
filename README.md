@@ -5,6 +5,11 @@ Suported ONNX runtime for [pyannote.audio](https://github.com/pyannote/pyannote-
 ## Installation
 Only Python 3.8+ is supported.
 ```bash
+# for CPU
+pip install onnxruntime
+# for GPU, check version on: https://onnxruntime.ai/docs/build/eps.html#cuda
+pip install onnxruntime-gpu
+# install pyannote
 pip install -e .
 ```
 
@@ -30,14 +35,21 @@ python vad.py -m onnx_model/vad_model.bin -i tests/data/test_vad.wav
 
 ## Benchmark
 
-Test file [tests/data/test_vad.wav](tests/data/test_vad.wav)
-+ CPU Intel Core i5 10400
-+ GPU Nvidia RTX 3090
+Test file [tests/data/test_vad.wav](tests/data/test_vad.wav) with duration 6m15s
++ CPU Intel(R) Xeon(R) CPU E5-2683 v3 @ 2.00GHz
++ GPU Nvidia GTX 1080Ti
 
+Batch size 32
 | Backend | CPU time (s)   | GPU time (s)   |
 | :---:   | :---: | :---: |
-| PyTorch | 9.56    | -   |
-| ONNX    | 5.32     | -   |
+| PyTorch | 12.0    | 1.5   |
+| ONNX    | 4.33    | NA   |
+
+Batch size 64
+| Backend | CPU time (s)   | GPU time (s)   |
+| :---:   | :---: | :---: |
+| PyTorch |  inf   | 1.99   |
+| ONNX    | 4.02    | NA   |
 
 ## Citations
 
