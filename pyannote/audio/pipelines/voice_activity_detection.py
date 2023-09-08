@@ -120,7 +120,11 @@ class VoiceActivityDetection(Pipeline):
         self.fscore = fscore
 
         # load model and send it to GPU (when available and not already on GPU)
-        model = get_model(segmentation, use_auth_token=use_auth_token)
+        if isinstance(segmentation, Text) and segmentation.endswith("onnx"):
+            model = segmentation
+        else:
+            model = get_model(segmentation, use_auth_token=use_auth_token)
+
         inference_kwargs["pre_aggregation_hook"] = lambda scores: np.max(
             scores, axis=-1, keepdims=True
         )

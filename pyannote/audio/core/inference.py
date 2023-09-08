@@ -34,13 +34,16 @@ from pyannote.core import Segment, SlidingWindow, SlidingWindowFeature
 from pytorch_lightning.utilities.memory import is_oom_error
 
 from pyannote.audio.core.io import AudioFile
-from pyannote.audio.core.model import Model, Specifications
+from pyannote.audio.core.model import Model, Output, Specifications
 from pyannote.audio.core.task import Resolution
 from pyannote.audio.utils.multi_task import map_with_specifications
 from pyannote.audio.utils.permutation import mae_cost_func, permutate
 from pyannote.audio.utils.powerset import Powerset
 from pyannote.audio.utils.reproducibility import fix_reproducibility
-
+import onnxruntime
+from loguru import logger
+from pyannote.audio.core.io import Audio
+from functools import cached_property
 
 class BaseInference:
     pass
@@ -96,29 +99,37 @@ class Inference(BaseInference):
         use_auth_token: Union[Text, None] = None,
     ):
         # ~~~~ model ~~~~~
+        if isinstance(model, Model):
+            pass
+        elif isinstance(model, Text):
+            if model.endswith("onnx"):
+                logger.info("use onnx model")
+                model_path = model
+                model = onnxruntime.InferenceSession(model, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            else:
+                model = Model.from_pretrained(
+                    model, use_auth_token=use_auth_token, strict=False
+                )
+        use_onnx_model = isinstance(model, onnxruntime.InferenceSession)
 
-        self.model = (
-            model
-            if isinstance(model, Model)
-            else Model.from_pretrained(
-                model,
-                map_location=device,
-                strict=False,
-                use_auth_token=use_auth_token,
-            )
-        )
-
+        self.use_onnx_model = use_onnx_model
+        
         if device is None:
-            device = self.model.device
+            device = torch.device("cpu")
+            
         self.device = device
-
-        self.model.eval()
-        self.model.to(self.device)
-
-        specifications = self.model.specifications
+        self.model = model
+        
+        if use_onnx_model:
+            specifications = torch.load(model_path.replace(".onnx", ".pt"))
+        else:
+            self.model.eval()
+            self.model.to(self.device)
+            specifications = model.specifications
+        
+        self.audio = Audio(sample_rate=16000, mono="downmix")
 
         # ~~~~ sliding window ~~~~~
-
         if window not in ["sliding", "whole"]:
             raise ValueError('`window` must be "sliding" or "whole".')
 
@@ -180,8 +191,8 @@ class Inference(BaseInference):
                 f"Either decrease step or increase duration."
             )
         self.step = step
-
         self.batch_size = batch_size
+        self.specifications = specifications
 
     def to(self, device: torch.device) -> "Inference":
         """Send internal model to `device`"""
@@ -190,12 +201,17 @@ class Inference(BaseInference):
             raise TypeError(
                 f"`device` must be an instance of `torch.device`, got `{type(device).__name__}`"
             )
-
-        self.model.to(device)
-        self.conversion.to(device)
-        self.device = device
+        if not self.use_onnx_model:
+            self.model.to(device)
+            self.conversion.to(device)
+            self.device = device
         return self
-
+    
+    def forward_onnx(self, chunks: torch.Tensor) -> Union[np.ndarray, Tuple[np.ndarray]]:
+        chunks = chunks.numpy()
+        outputs = self.model.run(None, {"input": chunks})[0]
+        return outputs
+    
     def infer(self, chunks: torch.Tensor) -> Union[np.ndarray, Tuple[np.ndarray]]:
         """Forward pass
 
@@ -212,23 +228,65 @@ class Inference(BaseInference):
             Model output.
         """
 
-        with torch.inference_mode():
-            try:
-                outputs = self.model(chunks.to(self.device))
-            except RuntimeError as exception:
-                if is_oom_error(exception):
-                    raise MemoryError(
-                        f"batch_size ({self.batch_size: d}) is probably too large. "
-                        f"Try with a smaller value until memory error disappears."
-                    )
-                else:
-                    raise exception
+        if self.use_onnx_model:
+            outputs = self.forward_onnx(chunks)
+        else:
+            with torch.inference_mode():
+                try:
+                    outputs = self.model(chunks.to(self.device))
+                except RuntimeError as exception:
+                    if is_oom_error(exception):
+                        raise MemoryError(
+                            f"batch_size ({self.batch_size: d}) is probably too large. "
+                            f"Try with a smaller value until memory error disappears."
+                        )
+                    else:
+                        raise exception
 
         def __convert(output: torch.Tensor, conversion: nn.Module, **kwargs):
-            return conversion(output).cpu().numpy()
+            if isinstance(output, np.ndarray):
+                return output
+            else:
+                return conversion(output).cpu().numpy()
 
         return map_with_specifications(
-            self.model.specifications, __convert, outputs, self.conversion
+            self.specifications, __convert, outputs, self.conversion
+        )
+
+    def get_example_input_array(self) -> torch.Tensor:
+        return torch.randn(
+            size=(1, 1, self.audio.get_num_samples(self.specifications.duration)),
+            device=self.device
+        )
+
+    @cached_property
+    def example_output(self) -> Union[Output, Tuple[Output]]:
+        """Example output"""
+        example_input_array = self.get_example_input_array()
+
+        with torch.inference_mode():
+            example_output = self.infer(example_input_array)
+
+        def __example_output(
+            example_output: torch.Tensor,
+            specifications: Specifications = None,
+        ) -> Output:
+            _, num_frames, dimension = example_output.shape
+
+            if specifications.resolution == Resolution.FRAME:
+                frame_duration = specifications.duration / num_frames
+                frames = SlidingWindow(step=frame_duration, duration=frame_duration)
+            else:
+                frames = None
+
+            return Output(
+                num_frames=num_frames,
+                dimension=dimension,
+                frames=frames,
+            )
+
+        return map_with_specifications(
+            self.specifications, __example_output, example_output
         )
 
     def slide(
@@ -258,7 +316,7 @@ class Inference(BaseInference):
             and (num_frames, dimension) for frame-level tasks.
         """
 
-        window_size: int = self.model.audio.get_num_samples(self.duration)
+        window_size: int = int(self.duration * sample_rate)
         step_size: int = round(self.step * sample_rate)
         _, num_samples = waveform.shape
 
@@ -270,9 +328,9 @@ class Inference(BaseInference):
             return example_output.frames
 
         frames: Union[SlidingWindow, Tuple[SlidingWindow]] = map_with_specifications(
-            self.model.specifications,
+            self.specifications,
             __frames,
-            self.model.example_output,
+            self.example_output,
         )
 
         # prepare complete chunks
@@ -299,9 +357,7 @@ class Inference(BaseInference):
         def __empty_list(**kwargs):
             return list()
 
-        outputs: Union[
-            List[np.ndarray], Tuple[List[np.ndarray]]
-        ] = map_with_specifications(self.model.specifications, __empty_list)
+        outputs: Union[List[np.ndarray], Tuple[List[np.ndarray]]] = map_with_specifications(self.specifications, __empty_list)
 
         if hook is not None:
             hook(completed=0, total=num_chunks + has_last_chunk)
@@ -317,7 +373,7 @@ class Inference(BaseInference):
             batch_outputs: Union[np.ndarray, Tuple[np.ndarray]] = self.infer(batch)
 
             _ = map_with_specifications(
-                self.model.specifications, __append_batch, outputs, batch_outputs
+                self.specifications, __append_batch, outputs, batch_outputs
             )
 
             if hook is not None:
@@ -327,9 +383,7 @@ class Inference(BaseInference):
         if has_last_chunk:
             last_outputs = self.infer(last_chunk[None])
 
-            _ = map_with_specifications(
-                self.model.specifications, __append_batch, outputs, last_outputs
-            )
+            _ = map_with_specifications(self.specifications, __append_batch, outputs, last_outputs)
 
             if hook is not None:
                 hook(
@@ -341,7 +395,7 @@ class Inference(BaseInference):
             return np.vstack(output)
 
         outputs: Union[np.ndarray, Tuple[np.ndarray]] = map_with_specifications(
-            self.model.specifications, __vstack, outputs
+            self.specifications, __vstack, outputs
         )
 
         def __aggregate(
@@ -388,7 +442,7 @@ class Inference(BaseInference):
             return aggregated
 
         return map_with_specifications(
-            self.model.specifications, __aggregate, outputs, frames
+            self.specifications, __aggregate, outputs, frames
         )
 
     def __call__(
@@ -418,8 +472,10 @@ class Inference(BaseInference):
         """
 
         fix_reproducibility(self.device)
-
-        waveform, sample_rate = self.model.audio(file)
+        # if self.use_onnx_model:
+        #     waveform, sample_rate = soundfile.read(file["audio"], format="float32")
+        # else:
+        waveform, sample_rate = self.audio(file)
 
         if self.window == "sliding":
             return self.slide(waveform, sample_rate, hook=hook)
@@ -430,7 +486,7 @@ class Inference(BaseInference):
             return outputs[0]
 
         return map_with_specifications(
-            self.model.specifications, __first_sample, outputs
+            self.specifications, __first_sample, outputs
         )
 
     def crop(
@@ -503,7 +559,7 @@ class Inference(BaseInference):
                 )
                 return SlidingWindowFeature(output.data, shifted_frames)
 
-            return map_with_specifications(self.model.specifications, __shift, outputs)
+            return map_with_specifications(self.specifications, __shift, outputs)
 
         if isinstance(chunk, Segment):
             waveform, sample_rate = self.model.audio.crop(
@@ -520,7 +576,7 @@ class Inference(BaseInference):
             return outputs[0]
 
         return map_with_specifications(
-            self.model.specifications, __first_sample, outputs
+            self.specifications, __first_sample, outputs
         )
 
     @staticmethod

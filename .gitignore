@@ -89,3 +89,6 @@ pyannote/audio/version.py
 
 # vim
 .vim
+.bin
+*.bin
+*.onnx
