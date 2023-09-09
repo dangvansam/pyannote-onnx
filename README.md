@@ -37,19 +37,19 @@ python vad.py -m onnx_model/vad_model.bin -i tests/data/test_vad.wav
 
 Test file [tests/data/test_vad.wav](tests/data/test_vad.wav) with duration 6m15s
 + CPU Intel(R) Xeon(R) CPU E5-2683 v3 @ 2.00GHz
-+ GPU Nvidia GTX 1080Ti
++ GPU Nvidia RTX 3090
 
 Batch size 32
 | Backend | CPU time (s)   | GPU time (s)   |
 | :---:   | :---: | :---: |
-| PyTorch | 12.0    | 1.5   |
-| ONNX    | 4.33    | NA   |
+| PyTorch | 12.0    | 1.76   |
+| ONNX    | 4.33    | 1.88   |
 
-Batch size 64
+<!-- Batch size 64
 | Backend | CPU time (s)   | GPU time (s)   |
 | :---:   | :---: | :---: |
 | PyTorch |  inf   | 1.99   |
-| ONNX    | 4.02    | NA   |
+| ONNX    | 4.02    | NA   | -->
 
 ## Citations
 
